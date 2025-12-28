@@ -1,0 +1,301 @@
+# Stochastic Models and Calibration Guide
+
+This app evaluates mortgage and investment strategies using Monte Carlo simulation.  
+All results are driven by a small set of stochastic models (interest rates, asset returns, and mortgage margins), with mortgage amortisation and portfolio accounting applied deterministically conditional on those simulated paths.
+
+This document explains:
+- which models are used,
+- how each parameter should be interpreted,
+- practical calibration guidance,
+- expected behaviour and known limitations.
+
+---
+
+## 1. Overview of the stochastic engine
+
+The simulation consists of five stochastic components:
+
+1. **UK short-rate factor**  
+   Drives the mortgage base rate.
+
+2. **Global short-rate factor**  
+   Drives global bond yields and bond returns.
+
+3. **Mortgage margin process**  
+   Models repricing risk at refinance dates.
+
+4. **Equity returns**  
+   Fat-tailed monthly log returns.
+
+5. **Bond returns**  
+   Duration-based approximation driven by the global rate factor.
+
+All mortgage cashflows and portfolio wealth paths are deterministic given these simulated drivers.
+
+---
+
+## 2. Two-factor interest rate model (UK and Global)
+
+### 2.1 Model specification
+
+Both UK and Global rates follow a Cox–Ingersoll–Ross (CIR)–style process:
+
+$$
+dr_t = \kappa(\theta - r_t)\,dt + \sigma\sqrt{r_t}\,dW_t
+$$
+
+where:
+- $r_t$ is the annualised short rate (decimal form, e.g. 0.05 = 5%),
+- $\kappa$ is the mean reversion speed (per year),
+- $\theta$ is the long-run mean rate,
+- $\sigma$ is the diffusion scale,
+- $dt = \tfrac{1}{12}$ (monthly timestep).
+
+The two factors are correlated at the innovation level:
+
+$$
+dW^{gl}_t = \rho\,dW^{uk}_t + \sqrt{1-\rho^2}\,dZ_t
+$$
+
+with correlation parameter $\rho \in [-1,1]$.
+
+---
+
+### 2.2 Discretisation and implementation details
+
+The app uses **full-truncation Euler discretisation**:
+- volatility is computed using $\sqrt{\max(r_t,0)}$,
+- the next rate is clamped to $r_{t+1} \ge 0$,
+- an optional hard **cap** is applied as a guard rail.
+
+This ensures numerical stability and non-negative rates at all times.
+
+> Note: An exact CIR sampler exists in the codebase, but the primary simulation path uses the two-factor full-truncation scheme described here.
+
+---
+
+### 2.3 UI parameter mapping
+
+| UI Parameter | Mathematical meaning |
+|--------------|----------------------|
+| `uk_r0`, `gl_r0` | Initial rate $r_0$ |
+| `uk_kappa`, `gl_kappa` | Mean reversion speed $\kappa$ |
+| `uk_theta`, `gl_theta` | Long-run mean $\theta$ |
+| `uk_sigma`, `gl_sigma` | Volatility scale $\sigma$ |
+| `rate_corr` | Correlation $\rho$ |
+| `uk_cap`, `gl_cap` | Hard cap on simulated rates |
+
+All rates are annualised and expressed in **decimal form**.
+
+---
+
+### 2.4 Calibration guidance (practical)
+
+#### Long-run mean ($\theta$)
+Set $\theta$ to the **policy or regime level** you believe rates will revert toward:
+- example: 0.03 for a 3% long-run base-rate world.
+
+#### Mean reversion speed ($\kappa$)
+$\kappa$ controls how quickly rates return to $\theta$.
+
+A useful rule of thumb uses the **half-life** $h$ (years):
+
+$$
+\kappa \approx \frac{\ln 2}{h}
+$$
+
+Examples:
+- $h = 1$ year → $\kappa \approx 0.69$
+- $h = 2$ years → $\kappa \approx 0.35$
+- $h = 5$ years → $\kappa \approx 0.14$
+
+#### Volatility scale ($\sigma$)
+Because volatility scales with $\sqrt{r}$, $\sigma$ is **not** a percentage volatility.
+
+Approximate calibration:
+- choose a representative rate level $\bar r$ (often $\theta$),
+- measure monthly standard deviation of rate changes $\text{Std}(\Delta r)$,
+
+$$
+\sigma \approx \frac{\text{Std}(\Delta r)}{\sqrt{\bar r}\sqrt{dt}}
+$$
+
+#### Correlation ($\rho$)
+Set `rate_corr` to the empirical correlation of monthly changes between:
+- UK base rate (or SONIA proxy),
+- chosen global short-rate proxy.
+
+---
+
+### 2.5 Behavioural interpretation
+
+- Higher $\kappa$ → faster reversion, less persistent shocks.
+- Higher $\theta$ → higher long-run mortgage rates and bond carry.
+- Higher $\sigma$ → more volatile mortgage payments and bond returns.
+- Higher $\rho$ → reduced diversification between mortgage risk and global bond risk.
+
+---
+
+## 3. Mortgage margin model
+
+### 3.1 Specification
+
+The mortgage rate applied to cashflows is:
+
+$$
+\text{Mortgage Rate}_t = r^{uk}_t + m_t
+$$
+
+Margin $m_t$ is modelled as:
+
+- **Fixed**:  
+  $$
+  m_t = m_{\text{fixed}}
+  $$
+
+- **Stochastic (refinance redraw)**:  
+  At refinance months (including $t=0$),
+  $$
+  m \sim \mathcal{N}(\mu_m,\sigma_m)
+  $$
+  then clamp to $[m_{\min}, m_{\max}]$ and hold constant until the next refinance.
+
+---
+
+### 3.2 UI parameter mapping
+
+| UI Parameter | Meaning |
+|--------------|--------|
+| `margin_mode` | Fixed or stochastic |
+| `margin_fixed` | Fixed margin |
+| `margin_refi_mean` | $\mu_m$ |
+| `margin_refi_sd` | $\sigma_m$ |
+| `margin_min`, `margin_max` | Bounds |
+| `refi_every_months` | Refinance frequency |
+
+---
+
+### 3.3 Interpretation and limitations
+
+- Margin risk enters **discretely**, not continuously.
+- Refinance frequency is the dominant driver of margin volatility.
+- Margins are not state-dependent (no LTV or credit-cycle linkage).
+
+---
+
+## 4. Equity return model
+
+### 4.1 Specification
+
+Monthly equity log returns are:
+
+$$
+\Delta \ln S_t
+=
+\left(\mu - \tfrac{1}{2}\sigma^2\right)dt
++
+\sigma\sqrt{dt}\,\varepsilon_t
+$$
+
+where:
+- $\mu$ is annualised drift,
+- $\sigma$ is annualised volatility,
+- $\varepsilon_t$ follows a Student-$t$ distribution with $\nu > 2$, rescaled to unit variance.
+
+---
+
+### 4.2 UI parameter mapping
+
+| UI Parameter | Meaning |
+|--------------|--------|
+| `equity_mu` | Expected return $\mu$ |
+| `equity_sigma` | Volatility $\sigma$ |
+| `equity_df` | Degrees of freedom $\nu$ |
+
+---
+
+### 4.3 Interpretation and limitations
+
+- Lower $\nu$ → fatter tails and more extreme drawdowns.
+- No volatility clustering or correlation with interest rates.
+- Returns are IID conditional on parameters.
+
+---
+
+## 5. Bond return model
+
+### 5.1 Specification
+
+Global bond yields are approximated as:
+
+$$
+y^{gl}_t = r^{gl}_t + s_b
+$$
+
+Monthly **simple** bond returns are:
+
+$$
+R^{bond}_t
+\approx
+\frac{y^{gl}_t}{12}
+-
+D\,\Delta y^{gl}_t
++
+\frac{r^{uk}_t - r^{gl}_t}{12}
++
+\varepsilon_t
+$$
+
+where:
+- $D$ is effective duration,
+- $s_b$ is a constant yield spread,
+- $\varepsilon_t \sim \mathcal{N}(0,\sigma^2_{\text{idio}}\,dt)$.
+
+---
+
+### 5.2 UI parameter mapping
+
+| UI Parameter | Meaning |
+|--------------|--------|
+| `bond_duration` | Duration $D$ |
+| `bond_spread` | Yield spread $s_b$ |
+| `bond_idio_sigma` | Idiosyncratic volatility |
+
+---
+
+### 5.3 Interpretation and limitations
+
+- Linear duration only (no convexity).
+- No dynamic credit spreads.
+- FX hedge carry is approximated using short-rate differentials.
+
+---
+
+## 6. Portfolio mechanics and accounting modes
+
+- Portfolios rebalance **monthly** to target weights.
+- Annual OCF is applied as a monthly drag:
+  $$
+  1 - \frac{\text{OCF}}{12}
+  $$
+
+### Cashflow accounting modes
+Results are **highly sensitive** to `cashflow_mode`:
+- some modes assume mortgage payments are funded externally,
+- others deduct payments directly from portfolio wealth.
+
+These modes answer **different economic questions** and should not be compared casually.
+
+---
+
+## 7. Key limitations (summary)
+
+- Short-rate model is single-factor per region and discretised.
+- Equity model has fat tails but no regime-dependent volatility.
+- Bond model is an approximation, not a full term-structure model.
+- Mortgage margin is reset-based, not credit-cycle-driven.
+- Caps and accounting conventions materially affect tail outcomes.
+
+---
+
+This app is best interpreted as a **scenario analysis and planning tool**, not a precise forecasting engine.
